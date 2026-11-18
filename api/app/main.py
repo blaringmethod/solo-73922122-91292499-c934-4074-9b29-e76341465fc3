@@ -22,7 +22,7 @@ from fastapi.responses import RedirectResponse
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
-from . import backup, config, db, lsn, recovery, state
+from . import backup, config, db, lsn, recovery, state, walarchive
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -33,11 +33,20 @@ NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
 
 
 def _readiness_loop():
+    # Every ~30s also sweep interrupted temp files and re-archive any short
+    # segment whose source WAL is still present; readiness itself refreshes
+    # every 2s so a missing/short segment is reflected almost immediately.
+    tick = 0
     while True:
         try:
             recovery.refresh_restore_points()
+            if config.AUTO_REPAIR and tick % 15 == 0:
+                report = recovery.repair_archive_from_source()
+                if report["repaired"] or report["temp_removed"]:
+                    log.info("archive sweep: %s", report)
         except Exception:
             log.exception("readiness refresh failed")
+        tick += 1
         time.sleep(2)
 
 
@@ -109,6 +118,44 @@ def backup_status():
         "error": state.kv_get("backup_error") or None,
         "backup_dir": config.BACKUP_DIR,
     }
+
+
+# --------------------------------------------------------------------------
+# WAL archive safety
+# --------------------------------------------------------------------------
+
+@app.get("/archive", tags=["archive"])
+def archive_status():
+    """Inventory of the WAL archive, flagging truncated segments and temp files.
+
+    A segment is considered valid only at the full 16 MiB size; anything
+    shorter is reported as truncated and is treated as missing by restore
+    point readiness and recovery admission.
+    """
+    items = walarchive.list_archive()
+    truncated = [i["name"] for i in items if i["kind"] == "segment"
+                 and not i["complete"]]
+    return {
+        "archive_dir": config.WAL_ARCHIVE_DIR,
+        "segments": len([i for i in items if i["kind"] == "segment"]),
+        "complete": len([i for i in items if i["kind"] == "segment"
+                         and i["complete"]]),
+        "truncated": truncated,
+        "temp_files": [i["name"] for i in items if i["kind"] == "temp"],
+        "items": items,
+    }
+
+
+@app.post("/archive/repair", tags=["archive"])
+def archive_repair():
+    """Re-archive leftover short files from the source pg_wal while it exists.
+
+    Complete archives are never overwritten. Returns what was repaired and
+    which short files cannot be repaired because the source WAL is gone.
+    """
+    report = recovery.repair_archive_from_source()
+    recovery.refresh_restore_points()
+    return report
 
 
 # --------------------------------------------------------------------------
@@ -326,7 +373,53 @@ def demo_overview():
     return {
         "primary": {"total_rows": total, "per_intersection": per_ix},
         "backup": backup_status(),
+        "archive": archive_status(),
         "restore_points": state.q("SELECT * FROM restore_points ORDER BY id"),
         "recoveries": state.q("SELECT * FROM recoveries ORDER BY id DESC"),
         "current_recovery_id": state.kv_get("current_recovery_id"),
     }
+
+
+# --------------------------------------------------------------------------
+# demo fault injection: simulate archive interruption / later loss
+# --------------------------------------------------------------------------
+
+class TruncateRequest(BaseModel):
+    name: str = Field(..., pattern=NAME_PATTERN)
+    bytes: int = Field(4096, ge=1, le=16 * 1024 * 1024 - 1)
+
+
+@app.post("/demo/fault/truncate-archive", tags=["demo-fault"])
+def fault_truncate_archive(req: TruncateRequest):
+    """Simulate an interrupted archive copy: leave a short file in the archive.
+
+    Mirrors the production fault: the file exists but is shorter than a WAL
+    segment, so readiness must drop and recovery must refuse it. The source
+    WAL can then re-publish it via POST /archive/repair (or the primary's
+    own archive retries).
+    """
+    path = walarchive.archive_path(req.name)
+    if not os.path.exists(path):
+        raise HTTPException(404, f"archived segment {req.name!r} not found")
+    with open(path, "r+b") as fh:
+        fh.truncate(req.bytes)
+    recovery.refresh_restore_points()
+    return {
+        "truncated": req.name,
+        "size": os.path.getsize(path),
+        "note": "fault injected: segment is now short; points needing it are "
+                "no longer selectable until /archive/repair succeeds",
+    }
+
+
+@app.post("/demo/fault/remove-archive", tags=["demo-fault"])
+def fault_remove_archive(name: str = Query(..., pattern=NAME_PATTERN)):
+    """Simulate later loss of an already archived, complete segment."""
+    path = walarchive.archive_path(name)
+    if not os.path.exists(path):
+        raise HTTPException(404, f"archived segment {name!r} not found")
+    os.remove(path)
+    recovery.refresh_restore_points()
+    return {"removed": name,
+            "note": "fault injected: archive segment deleted; retry recovery "
+                    "is rejected until it is re-archived"}

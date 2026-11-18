@@ -23,7 +23,7 @@ import subprocess
 import threading
 import time
 
-from . import config, db, lsn, state
+from . import config, db, lsn, state, walarchive
 
 log = logging.getLogger("recovery")
 
@@ -144,37 +144,135 @@ def monitor_current():
 # restore point readiness (WAL archive completeness)
 # --------------------------------------------------------------------------
 
+def _required_wal(backup_end_lsn: str, point_lsn: str) -> list[str]:
+    """WAL segments that must be fully archived to reach a restore point."""
+    return lsn.wal_files_between(lsn.parse(backup_end_lsn), lsn.parse(point_lsn))
+
+
+def _classify_archive(names: list[str]) -> tuple[list[str], list[str]]:
+    """Split required segment names into (missing, truncated).
+
+    A segment counts as usable only when it exists *and* has the full
+    16 MiB size. A truncated file is a broken archive, not a valid one.
+    """
+    missing, truncated = [], []
+    for name in names:
+        full = os.path.join(config.WAL_ARCHIVE_DIR, name)
+        if not os.path.exists(full):
+            missing.append(name)
+        elif not walarchive.is_published_complete(name):
+            truncated.append(name)
+    return missing, truncated
+
+
+def repair_archive_from_source() -> dict:
+    """Re-publish broken/missing WAL while the source segment still exists.
+
+    Two repair paths, both safe (a complete archive is never overwritten):
+      * leftover truncated/temp segments in the archive directory;
+      * segments required by a restore point that are absent from the
+        archive but still retained in the source cluster's pg_wal.
+    The primary's archive_command normally retries this itself; this is the
+    API-side repair for cases where a segment is stuck or was lost out of
+    band. Returns a small report; safe to call repeatedly.
+    """
+    report = {"repaired": [], "still_truncated": [], "source_gone": [],
+              "temp_removed": walarchive.cleanup_temp_files()}
+    source_dir = config.SOURCE_PG_WAL
+
+    def republish(name: str) -> None:
+        src = os.path.join(source_dir, name)
+        if not os.path.exists(src):
+            if name not in report["source_gone"]:
+                report["source_gone"].append(name)
+            if name not in report["still_truncated"]:
+                report["still_truncated"].append(name)
+            return
+        try:
+            walarchive.publish_copy(src, name)
+            report["repaired"].append(name)
+            log.info("re-archived segment %s from source pg_wal", name)
+        except walarchive.ArchiveError as exc:
+            log.warning("could not re-archive %s: %s", name, exc)
+            report["still_truncated"].append(name)
+
+    # 1. truncated segments sitting in the archive directory
+    for item in walarchive.list_archive():
+        if item["kind"] == "segment" and not item["complete"]:
+            republish(item["name"])
+
+    # 2. segments required by restore points but absent from the archive
+    backup_end = state.kv_get("backup_end_lsn")
+    if backup_end:
+        wanted = set()
+        for point in state.q("SELECT * FROM restore_points"):
+            if point["status"] == "expired":
+                continue
+            try:
+                wanted.update(_required_wal(backup_end, point["lsn"]))
+            except ValueError:
+                continue
+        for name in sorted(wanted):
+            if not walarchive.is_published_complete(name):
+                republish(name)
+    return report
+
+
 def refresh_restore_points():
+    """Recompute readiness of every restore point from the live archive.
+
+    Selectability is never sticky: a point marked ready moves back to
+    pending as soon as one of its required segments disappears or is
+    truncated, and it carries the offending segment names with it.
+    """
     backup_end = state.kv_get("backup_end_lsn")
     if not backup_end:
         return
-    start = lsn.parse(backup_end)
     backup_start = state.kv_get("backup_start_lsn")
-    for point in state.q("SELECT * FROM restore_points WHERE status = 'pending'"):
+    for point in state.q("SELECT * FROM restore_points"):
+        if point["status"] == "expired":
+            # an expired point can never become usable again for this backup
+            continue
         # a point at/before the backup's own redo point can never be
         # recovered from this backup (it already contains newer state)
         if backup_start and lsn.parse(point["lsn"]) <= lsn.parse(backup_start):
             state.exec(
-                "UPDATE restore_points SET status='expired' WHERE id=?", (point["id"],)
+                "UPDATE restore_points SET status='expired', "
+                "missing_wal='', truncated_wal='' WHERE id=?",
+                (point["id"],),
             )
             log.info("restore point %s predates the base backup -> expired", point["name"])
             continue
         try:
-            needed = lsn.wal_files_between(start, lsn.parse(point["lsn"]))
+            needed = _required_wal(backup_end, point["lsn"])
         except ValueError:
             continue
-        missing = [
-            f for f in needed
-            if not os.path.exists(os.path.join(config.WAL_ARCHIVE_DIR, f))
-        ]
-        if missing:
-            log.info(
-                "restore point %s: waiting for %d WAL file(s), e.g. %s",
-                point["name"], len(missing), missing[0],
+        missing, truncated = _classify_archive(needed)
+        if missing or truncated:
+            if point["status"] == "ready":
+                log.warning(
+                    "restore point %s was ready but its archive is now broken "
+                    "(missing=%d truncated=%d) -> pending",
+                    point["name"], len(missing), len(truncated),
+                )
+            else:
+                log.info(
+                    "restore point %s: waiting (missing=%d truncated=%d)",
+                    point["name"], len(missing), len(truncated),
+                )
+            state.exec(
+                "UPDATE restore_points SET status='pending', missing_wal=?, "
+                "truncated_wal=? WHERE id=?",
+                (",".join(missing), ",".join(truncated), point["id"]),
             )
         else:
-            state.exec("UPDATE restore_points SET status='ready' WHERE id=?", (point["id"],))
-            log.info("restore point %s is ready (WAL archive complete)", point["name"])
+            if point["status"] != "ready":
+                log.info("restore point %s is ready (WAL archive complete)", point["name"])
+            state.exec(
+                "UPDATE restore_points SET status='ready', "
+                "missing_wal='', truncated_wal='' WHERE id=?",
+                (point["id"],),
+            )
 
 
 # --------------------------------------------------------------------------
@@ -194,6 +292,36 @@ def _retire_current_replica():
             _stop_replica(rec["work_dir"])
 
 
+def _acceptance_check(point) -> None:
+    """Final gate at recovery submission.
+
+    A restore point that was marked ready earlier must still have every
+    required segment present *and* full-sized now. Raises Conflict (HTTP
+    409) otherwise; this runs before any healthy replica is retired.
+    """
+    backup_end = state.kv_get("backup_end_lsn")
+    if not backup_end:
+        raise Conflict("the startup base backup is not ready yet")
+    needed = _required_wal(backup_end, point["lsn"])
+    missing, truncated = _classify_archive(needed)
+    problems = []
+    if missing:
+        problems.append(f"missing archived WAL: {', '.join(missing[:5])}"
+                        + (" ..." if len(missing) > 5 else ""))
+    if truncated:
+        problems.append(f"truncated archived WAL: {', '.join(truncated[:5])}"
+                        + (" ..." if len(truncated) > 5 else ""))
+    if problems:
+        # keep the stored point status consistent with the archive
+        refresh_restore_points()
+        raise Conflict(
+            f"restore point {point['name']!r} cannot be recovered: "
+            + "; ".join(problems)
+            + ". Repair the archive (POST /archive/repair) and retry the "
+              "same restore point."
+        )
+
+
 def start_recovery(point_name):
     with _start_lock:
         if state.one("SELECT id FROM recoveries WHERE status = 'running'"):
@@ -201,15 +329,27 @@ def start_recovery(point_name):
         point = state.one("SELECT * FROM restore_points WHERE name=?", (point_name,))
         if not point:
             raise NotFound(f"restore point {point_name!r} does not exist")
-        refresh_restore_points()
-        point = state.one("SELECT * FROM restore_points WHERE name=?", (point_name,))
-        if point["status"] != "ready":
-            raise Conflict(
-                f"restore point {point_name!r} is not selectable yet: "
-                f"its WAL archive is incomplete (status={point['status']})"
-            )
         if state.kv_get("backup_status") != "ready":
             raise Conflict("the startup base backup is not ready yet")
+        if point["status"] == "expired":
+            raise Conflict(
+                f"restore point {point_name!r} predates the base backup "
+                "and cannot be recovered from it (status=expired)"
+            )
+
+        # Re-validate against the live archive BEFORE touching the current
+        # replica: a ready point whose WAL later went missing/short must be
+        # rejected while the healthy old replica keeps serving.
+        refresh_restore_points()
+        point = state.one("SELECT * FROM restore_points WHERE name=?", (point_name,))
+        # The acceptance check is authoritative: it names exactly which
+        # segments are missing or truncated.
+        _acceptance_check(point)
+        if point["status"] != "ready":
+            raise Conflict(
+                f"restore point {point_name!r} is not selectable: "
+                f"its WAL archive is incomplete (status={point['status']})"
+            )
 
         _retire_current_replica()
 
@@ -238,7 +378,13 @@ def _run_recovery(rec_id):
             raise RuntimeError(f"copying base backup failed: {result.stderr[-1000:]}")
         os.chmod(data, 0o700)
 
-        # 2. PITR configuration: replay archived WAL up to the named point
+        # 2. PITR configuration: replay archived WAL up to the named point.
+        # restore_command goes through the same size-gated helper: a segment
+        # that gets truncated after admission is refused instead of feeding
+        # a partial file to replay (PostgreSQL then fails recovery loudly).
+        restore_cmd = (
+            f"{config.PYTHON_BIN} -m app.walarchive restore %f %p"
+        )
         with open(os.path.join(data, "postgresql.auto.conf"), "a") as fh:
             fh.write(
                 "\n# ---- recovery-api ----\n"
@@ -247,7 +393,7 @@ def _run_recovery(rec_id):
                 "unix_socket_directories = '/tmp'\n"
                 "archive_mode = off\n"
                 "hot_standby = on\n"
-                f"restore_command = 'cp {config.WAL_ARCHIVE_DIR}/%f %p'\n"
+                f"restore_command = '{restore_cmd}'\n"
                 f"recovery_target_name = '{rec['restore_point']}'\n"
                 "recovery_target_action = 'pause'\n"
             )
@@ -328,3 +474,10 @@ def cleanup_on_startup():
     if os.path.isdir(config.RECOVERY_ROOT):
         for entry in os.listdir(config.RECOVERY_ROOT):
             _stop_replica(os.path.join(config.RECOVERY_ROOT, entry))
+    # interrupted archive copies from a previous lifetime must not linger
+    removed = walarchive.cleanup_temp_files()
+    if removed:
+        log.info("removed leftover temp archive files: %s", ", ".join(removed))
+    # readiness is recomputed on the first refresh; truncated archives stay
+    # visible there until the primary's retry (or /archive/repair) fixes them
+    refresh_restore_points()

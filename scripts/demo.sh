@@ -82,4 +82,36 @@ say "9. assertions"
 [ "$primary_total" = "36" ] || fail "primary should hold 36 rows (30 left + 6 new), got $primary_total"
 [ "$primary_ixb"  = "6"  ] || fail "primary should hold 6 IXB rows, got $primary_ixb"
 
-printf '\n\033[32mDEMO OK: deleted rows recovered on the isolated replica; the primary kept collecting.\033[0m\n'
+say "10. archive safety: short file makes the point unselectable, old replica keeps serving"
+# pick the WAL segment holding the restore point itself: it is guaranteed to
+# be part of the range required to reach that point.
+victim=$(curl -fsS "$BASE/restore-points" | jq -r --arg p "$POINT" \
+         '.items[] | select(.name==$p) | .wal_file')
+[ -n "$victim" ] || fail "could not determine the WAL file of $POINT"
+curl -fsS -X POST "$BASE/demo/fault/truncate-archive" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"$victim\",\"bytes\":4096}" | jq .
+# the healthy replica from step 7 must still answer
+curl -fsS "$BASE/replica/traffic?limit=1" >/dev/null \
+  || fail "healthy old replica must keep serving while admission is blocked"
+code=$(curl -s -o /tmp/demo_reject.json -w '%{http_code}' -X POST "$BASE/recoveries" \
+       -H 'Content-Type: application/json' -d "{\"restore_point\":\"$POINT\"}")
+[ "$code" = "409" ] || fail "recovery against truncated archive must be 409, got $code"
+jq . /tmp/demo_reject.json
+# the same healthy replica is still there (rejection happened before retirement)
+curl -fsS "$BASE/replica/traffic?limit=1" >/dev/null \
+  || fail "old replica must remain untouched after a rejected recovery"
+
+say "11. repair the short file from the source pg_wal, then retry the same point"
+curl -fsS -X POST "$BASE/archive/repair" | jq .
+curl -fsS "$BASE/archive" | jq '{complete, truncated, temp_files}'
+for _ in $(seq 1 30); do
+  st=$(curl -fsS "$BASE/restore-points" | jq -r --arg p "$POINT" \
+       '.items[] | select(.name==$p) | .status')
+  [ "$st" = "ready" ] && break
+  sleep 2
+done
+[ "$st" = "ready" ] || fail "restore point did not become ready again after repair"
+curl -fsS "$BASE/archive" | jq -e '.truncated == []' >/dev/null \
+  || fail "archive still reports truncated segments after repair"
+
+printf '\n\033[32mDEMO OK: atomic archiving, short-file gating, rejection-before-retirement and repair-retry all verified.\033[0m\n'

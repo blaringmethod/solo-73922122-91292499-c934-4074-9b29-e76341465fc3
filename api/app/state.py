@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS restore_points (
     name       TEXT NOT NULL UNIQUE,
     lsn        TEXT NOT NULL,
     wal_file   TEXT NOT NULL,
-    status     TEXT NOT NULL DEFAULT 'pending',   -- pending | ready
+    status     TEXT NOT NULL DEFAULT 'pending',   -- pending | ready | expired
+    missing_wal   TEXT NOT NULL DEFAULT '',       -- comma list: absent segments
+    truncated_wal TEXT NOT NULL DEFAULT '',       -- comma list: present but short
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS recoveries (
@@ -39,6 +41,22 @@ CREATE TABLE IF NOT EXISTS kv (
 """
 
 
+# Columns added after the first release; applied idempotently to old state DBs.
+_MIGRATIONS = (
+    ("restore_points", "missing_wal",
+     "ALTER TABLE restore_points ADD COLUMN missing_wal TEXT NOT NULL DEFAULT ''"),
+    ("restore_points", "truncated_wal",
+     "ALTER TABLE restore_points ADD COLUMN truncated_wal TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _apply_migrations(conn):
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(restore_points)")}
+    for _table, column, ddl in _MIGRATIONS:
+        if column not in existing:
+            conn.execute(ddl)
+
+
 def _conn():
     conn = sqlite3.connect(config.STATE_DB, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -48,6 +66,7 @@ def _conn():
 def init():
     with _lock, _conn() as conn:
         conn.executescript(_SCHEMA)
+        _apply_migrations(conn)
 
 
 def q(sql, args=()):

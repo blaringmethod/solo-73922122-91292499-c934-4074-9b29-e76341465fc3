@@ -1,4 +1,5 @@
 import os
+import sys
 
 # --- primary (source) database ---------------------------------------------
 PGHOST = os.environ.get("PGHOST", "db")
@@ -28,6 +29,25 @@ WAL_ARCHIVE_DIR = os.environ.get("WAL_ARCHIVE_DIR", "/wal_archive")
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/backups/base")
 RECOVERY_ROOT = os.environ.get("RECOVERY_ROOT", "/recovery_work")
 STATE_DB = os.environ.get("STATE_DB", "/state/api.db")
+# Read-only view of the source cluster's pg_wal directory. Used to re-archive
+# leftover truncated/missing segments while the source WAL file is still
+# retained (wal_keep_size). The compose stack mounts the primary's data dir
+# read-only at /source_pgdata; an empty/missing path disables out-of-band
+# repair, leaving the primary's own archive_command retries to do the work.
+SOURCE_PG_WAL = os.environ.get("SOURCE_PG_WAL", "/source_pgdata/pg_wal")
+# Background sweep that re-archives short/missing segments from SOURCE_PG_WAL.
+# The primary's archive_command already retries pending segments itself, and
+# POST /archive/repair heals externally caused damage on demand; the sweep is
+# therefore opt-in ("1") so demo fault windows stay deterministic.
+AUTO_REPAIR = os.environ.get("AUTO_REPAIR", "0") == "1"
+# Interpreter used for the replica restore_command helper. sys.executable
+# keeps it working both in the container venv and bare-metal test runs.
+PYTHON_BIN = os.environ.get("PYTHON_BIN") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "bin", "python")
+)
+# Fallback when the venv-relative path does not exist (e.g. system python).
+if not os.path.exists(PYTHON_BIN):
+    PYTHON_BIN = sys.executable
 
 # --- recovery behaviour ------------------------------------------------------
 RECOVERY_TIMEOUT_SEC = int(os.environ.get("RECOVERY_TIMEOUT_SEC", "180"))

@@ -18,7 +18,9 @@ services:
       - -c
       - archive_mode=on
       - -c
-      - archive_command=test ! -f /wal_archive/%f && cp %p /wal_archive/%f
+      # atomic, size-checked archiving: short files never get published and
+      # can be re-archived from the still-present source WAL (see script).
+      - archive_command=/archiver/safe_archive.sh %p %f
       - -c
       - archive_timeout=10
       - -c
@@ -29,6 +31,8 @@ services:
       - pgdata:/var/lib/postgresql/data
       - wal_archive:/wal_archive
       - ./db/init:/docker-entrypoint-initdb.d:ro
+      # safe archive_command implementation
+      - ./db/archiver:/archiver:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d traffic"]
       interval: 3s
@@ -53,11 +57,15 @@ services:
       # replica postgres refuses to run as root; the api container runs as root
       # and drops to this user (via gosu) only for the replica postmaster.
       REPLICA_RUN_AS: postgres
+      # read-only view of the source pg_wal, used only to re-archive leftover
+      # short files while the source WAL segment still exists.
+      SOURCE_PG_WAL: /source_pgdata/pg_wal
     volumes:
       - wal_archive:/wal_archive
       - backups:/backups
       - recovery_work:/recovery_work
       - api_state:/state
+      - pgdata:/source_pgdata:ro
     ports:
       - "8000:8000"
 
